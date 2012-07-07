@@ -84,6 +84,9 @@ static Persistent<String> version_symbol;
 static Persistent<String> ext_key_usage_symbol;
 static Persistent<String> onhandshakestart_sym;
 static Persistent<String> onhandshakedone_sym;
+static Persistent<String> onclienthello_sym;
+static Persistent<String> onnewsession_sym;
+static Persistent<String> sessionid_sym;
 
 static Persistent<FunctionTemplate> secure_context_constructor;
 
@@ -217,12 +220,62 @@ Handle<Value> SecureContext::Init(const Arguments& args) {
   }
 
   sc->ctx_ = SSL_CTX_new(method);
-  // Enable session caching?
-  SSL_CTX_set_session_cache_mode(sc->ctx_, SSL_SESS_CACHE_SERVER);
-  // SSL_CTX_set_session_cache_mode(sc->ctx_,SSL_SESS_CACHE_OFF);
+
+  // SSL session cache configuration
+  SSL_CTX_set_session_cache_mode(sc->ctx_,
+                                 SSL_SESS_CACHE_SERVER |
+                                 SSL_SESS_CACHE_NO_INTERNAL |
+                                 SSL_SESS_CACHE_NO_AUTO_CLEAR);
+  SSL_CTX_sess_set_get_cb(sc->ctx_, GetSessionCallback);
+  SSL_CTX_sess_set_new_cb(sc->ctx_, NewSessionCallback);
 
   sc->ca_store_ = NULL;
   return True();
+}
+
+SSL_SESSION* SecureContext::GetSessionCallback(SSL* s,
+                                               unsigned char* key,
+                                               int len,
+                                               int* copy) {
+  HandleScope scope;
+
+  Connection* p = static_cast<Connection*>(SSL_get_app_data(s));
+
+  *copy = NULL;
+  SSL_SESSION* sess = p->next_sess_;
+  p->next_sess_ = NULL;
+
+  return sess;
+}
+
+int SecureContext::NewSessionCallback(SSL* s, SSL_SESSION* sess) {
+  HandleScope scope;
+
+  Connection* p = static_cast<Connection*>(SSL_get_app_data(s));
+
+  // Check if session is small enough to be stored
+  int size = i2d_SSL_SESSION(sess, NULL);
+  if (size > 10 * 1024) return 0;
+
+  // Serialize session
+  char* serialized = new char[size];
+  unsigned char* pserialized = reinterpret_cast<unsigned char*>(serialized);
+  memset(serialized, 0, size);
+  i2d_SSL_SESSION(sess, &pserialized);
+
+  Handle<Value> argv[2] = {
+    Buffer::New(reinterpret_cast<char*>(sess->session_id),
+                sess->session_id_length)->handle_,
+    Buffer::New(serialized, size)->handle_
+  };
+
+  if (onnewsession_sym.IsEmpty()) {
+    onnewsession_sym = NODE_PSYMBOL("onnewsession");
+  }
+  MakeCallback(p->handle_, onnewsession_sym, 2, argv);
+  delete[] serialized;
+
+  return 0;
 }
 
 
@@ -663,6 +716,144 @@ Handle<Value> SecureContext::LoadPKCS12(const Arguments& args) {
 }
 
 
+size_t ClientHelloParser::Write(const char* data, size_t len) {
+  HandleScope scope;
+
+  // Just accumulate data, everything will be pushed to BIO later
+  if (state_ == kPaused) return 0;
+
+  // Copy incoming data to the internal buffer
+  // (which has a size of the biggest possible TLS frame)
+  size_t copied = (len < sizeof(data_) - offset_) ? len :
+      sizeof(data_) - offset_;
+  memcpy(data_ + offset_, data, copied);
+  offset_ += copied;
+
+  // Vars for parsing hello
+  bool is_clienthello = false;
+  uint8_t session_size = -1;
+  char* session_id = NULL;
+  Local<Object> hello;
+  Handle<Value> argv[1];
+
+  do {
+    switch (state_) {
+     case kWaiting:
+      // >= 5 bytes for header parsing
+      if (offset_ < 5) break;
+
+      if (data_[0] == kChangeCipherSpec || data_[0] == kAlert ||
+          data_[0] == kHandshake || data_[0] == kApplicationData) {
+        frame_len_ = ntohs(*reinterpret_cast<uint16_t*>(data_ + 3));
+        body_offset_ = 5;
+        state_ = kTLSHeader;
+      } else {
+        frame_len_ = ntohs(*reinterpret_cast<uint16_t*>(data_)) & 0x3fff;
+        state_ = kSSLHeader;
+        if (*reinterpret_cast<uint8_t*>(data_) & 0x40) {
+          // header with padding
+          body_offset_ = 3;
+        } else {
+          // without padding
+          body_offset_ = 2;
+        }
+      }
+
+      // Sanity check (too big frame)
+      if (frame_len_ >= sizeof(data_)) {
+        // Let OpenSSL handle it
+        Finish();
+        return copied;
+      }
+     case kTLSHeader:
+     case kSSLHeader:
+      // >= 5 + frame size bytes for frame parsing
+      if (offset_ < body_offset_ + frame_len_) break;
+
+      // Skip unsupported frames and gather some data from frame
+
+      // TODO: Check protocol version
+      if (*reinterpret_cast<uint8_t*>(data_ + body_offset_) == kClientHello) {
+        is_clienthello = true;
+
+        if (state_ == kTLSHeader) {
+          // Skip frame header, hello header, protocol version and random data
+          char* body = data_ + body_offset_ + 4 +
+                       2 + 32;
+          session_size = *reinterpret_cast<uint8_t*>(body);
+          session_id = body + 1;
+        } else if (state_ == kSSLHeader) {
+          // Skip header, version
+          char* body = data_ + body_offset_ + 3;
+          int ciphers_size = ntohs(*reinterpret_cast<uint16_t*>(body));
+          session_size = ntohs(*reinterpret_cast<uint16_t*>(body + 2));
+
+          session_id = body + 4 + ciphers_size;
+        } else {
+          // Whoa? How did we get here?
+          abort();
+        }
+
+        // Check if we overflowed (do not reply with any private data)
+        if (session_id + session_size > data_ + offset_) {
+          Finish();
+          return copied;
+        }
+
+        // TODO: Parse other things?
+      }
+
+      if (!is_clienthello) {
+        int r = BIO_write(c_->bio_read_, data_, body_offset_ + frame_len_);
+        c_->HandleBIOError(c_->bio_read_, "BIO_write", r);
+        c_->SetShutdownFlags();
+
+        // And shift all available data to the left
+        offset_ = offset_ - body_offset_ - frame_len_;
+        memmove(data_, data_ + body_offset_  + frame_len_, offset_);
+        state_ = kWaiting;
+
+        // And try to parse next frame
+        continue;
+      }
+
+      // Parse frame, call javascript handler and
+      // move parser into the paused state
+      if (onclienthello_sym.IsEmpty()) {
+        onclienthello_sym = NODE_PSYMBOL("onclienthello");
+      }
+      if (sessionid_sym.IsEmpty()) {
+        sessionid_sym = NODE_PSYMBOL("sessionId");
+      }
+
+      state_ = kPaused;
+      hello = Object::New();
+      hello->Set(sessionid_sym, Buffer::New(session_id, session_size)->handle_);
+
+      argv[0] = hello;
+      MakeCallback(c_->handle_, onclienthello_sym, 1, argv);
+      break;
+     case kEnded:
+     default:
+      break;
+    }
+  } while(false);
+
+  return copied;
+}
+
+
+void ClientHelloParser::Finish() {
+  assert(state_ != kEnded);
+  state_ = kEnded;
+
+  // Write all accumulated data
+  int r = BIO_write(c_->bio_read_, data_, offset_);
+  c_->HandleBIOError(c_->bio_read_, "BIO_write", r);
+  c_->SetShutdownFlags();
+}
+
+
 #ifdef SSL_PRINT_DEBUG
 # define DEBUG_PRINT(...) fprintf (stderr, __VA_ARGS__)
 #else
@@ -785,6 +976,7 @@ void Connection::Initialize(Handle<Object> target) {
   NODE_SET_PROTOTYPE_METHOD(t, "getPeerCertificate", Connection::GetPeerCertificate);
   NODE_SET_PROTOTYPE_METHOD(t, "getSession", Connection::GetSession);
   NODE_SET_PROTOTYPE_METHOD(t, "setSession", Connection::SetSession);
+  NODE_SET_PROTOTYPE_METHOD(t, "loadSession", Connection::LoadSession);
   NODE_SET_PROTOTYPE_METHOD(t, "isSessionReused", Connection::IsSessionReused);
   NODE_SET_PROTOTYPE_METHOD(t, "isInitFinished", Connection::IsInitFinished);
   NODE_SET_PROTOTYPE_METHOD(t, "verifyError", Connection::VerifyError);
@@ -1111,9 +1303,15 @@ Handle<Value> Connection::EncIn(const Arguments& args) {
           String::New("off + len > buffer.length")));
   }
 
-  int bytes_written = BIO_write(ss->bio_read_, buffer_data + off, len);
-  ss->HandleBIOError(ss->bio_read_, "BIO_write", bytes_written);
-  ss->SetShutdownFlags();
+  int bytes_written;
+
+  if (ss->is_server_ && !ss->hello_parser_.ended()) {
+    bytes_written = ss->hello_parser_.Write(buffer_data + off, len);
+  } else {
+    bytes_written = BIO_write(ss->bio_read_, buffer_data + off, len);
+    ss->HandleBIOError(ss->bio_read_, "BIO_write", bytes_written);
+    ss->SetShutdownFlags();
+  }
 
   return scope.Close(Integer::New(bytes_written));
 }
@@ -1458,6 +1656,30 @@ Handle<Value> Connection::SetSession(const Arguments& args) {
     Local<String> eStr = String::New("SSL_set_session error");
     return ThrowException(Exception::Error(eStr));
   }
+
+  return True();
+}
+
+Handle<Value> Connection::LoadSession(const Arguments& args) {
+  HandleScope scope;
+
+  Connection *ss = Connection::Unwrap(args);
+
+  if (args.Length() >= 1 && Buffer::HasInstance(args[0])) {
+    ssize_t slen = Buffer::Length(args[0].As<Object>());
+    char* sbuf = Buffer::Data(args[0].As<Object>());
+
+    const unsigned char* p = (unsigned char*) sbuf;
+    SSL_SESSION* sess = d2i_SSL_SESSION(NULL, &p, slen);
+
+    // Setup next session and move hello to the BIO buffer
+    if (ss->next_sess_ != NULL) {
+      SSL_SESSION_free(ss->next_sess_);
+    }
+    ss->next_sess_ = sess;
+  }
+
+  ss->hello_parser_.Finish();
 
   return True();
 }
