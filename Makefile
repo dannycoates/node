@@ -3,6 +3,7 @@
 BUILDTYPE ?= Release
 PYTHON ?= python
 DESTDIR ?=
+SIGN ?=
 
 # Default to verbose builds.
 # To do quiet/pretty builds, run `make V=` to set V to an empty string,
@@ -21,11 +22,11 @@ endif
 # to check for changes.
 .PHONY: node node_g
 
-node: config.gypi
+node: config.gypi out/Makefile
 	$(MAKE) -C out BUILDTYPE=Release V=$(V)
 	ln -fs out/Release/node node
 
-node_g: config.gypi
+node_g: config.gypi out/Makefile
 	$(MAKE) -C out BUILDTYPE=Debug V=$(V)
 	ln -fs out/Debug/node node_g
 
@@ -39,10 +40,10 @@ out/Makefile: common.gypi deps/uv/uv.gyp deps/http_parser/http_parser.gyp deps/z
 	$(PYTHON) tools/gyp_node -f make
 
 install: all
-	out/Release/node tools/installer.js install $(DESTDIR)
+	$(PYTHON) tools/install.py $@ $(DESTDIR)
 
 uninstall:
-	out/Release/node tools/installer.js uninstall
+	$(PYTHON) tools/install.py $@ $(DESTDIR)
 
 clean:
 	-rm -rf out/Makefile node node_g out/$(BUILDTYPE)/node blog.html email.md
@@ -113,7 +114,7 @@ apidoc_sources = $(wildcard doc/api/*.markdown)
 apidocs = $(addprefix out/,$(apidoc_sources:.markdown=.html)) \
           $(addprefix out/,$(apidoc_sources:.markdown=.json))
 
-apidoc_dirs = out/doc out/doc/api/ out/doc/api/assets out/doc/about out/doc/community out/doc/logos out/doc/images
+apidoc_dirs = out/doc out/doc/api/ out/doc/api/assets out/doc/about out/doc/community out/doc/download out/doc/logos out/doc/images
 
 apiassets = $(subst api_assets,api/assets,$(addprefix out/,$(wildcard doc/api_assets/*)))
 
@@ -131,6 +132,7 @@ website_files = \
 	out/doc/pipe.css \
 	out/doc/about/index.html \
 	out/doc/community/index.html \
+	out/doc/download/index.html \
 	out/doc/logos/index.html \
 	out/doc/changelog.html \
 	$(doc_images)
@@ -191,8 +193,22 @@ docclean:
 	-rm -rf out/doc
 
 VERSION=v$(shell $(PYTHON) tools/getnodeversion.py)
+RELEASE=$(shell $(PYTHON) tools/getnodeisrelease.py)
+PLATFORM=$(shell uname | tr '[:upper:]' '[:lower:]')
+ifeq ($(findstring x86_64,$(shell uname -m)),x86_64)
+DESTCPU ?= x64
+else
+DESTCPU ?= ia32
+endif
+ifeq ($(DESTCPU),x64)
+ARCH=x64
+else
+ARCH=x86
+endif
 TARNAME=node-$(VERSION)
 TARBALL=$(TARNAME).tar.gz
+BINARYNAME=$(TARNAME)-$(PLATFORM)-$(ARCH)
+BINARYTAR=$(BINARYNAME).tar.gz
 PKG=out/$(TARNAME).pkg
 packagemaker=/Developer/Applications/Utilities/PackageMaker.app/Contents/MacOS/PackageMaker
 
@@ -200,28 +216,7 @@ dist: doc $(TARBALL) $(PKG)
 
 PKGDIR=out/dist-osx
 
-pkg: $(PKG)
-
-$(PKG):
-	rm -rf $(PKGDIR)
-	rm -rf out/deps out/Release
-	./configure --prefix=$(PKGDIR)/32/usr/local --without-snapshot --dest-cpu=ia32
-	$(MAKE) install V=$(V)
-	rm -rf out/deps out/Release
-	./configure --prefix=$(PKGDIR)/usr/local --without-snapshot --dest-cpu=x64
-	$(MAKE) install V=$(V)
-	lipo $(PKGDIR)/32/usr/local/bin/node \
-		$(PKGDIR)/usr/local/bin/node \
-		-output $(PKGDIR)/usr/local/bin/node-universal \
-		-create
-	mv $(PKGDIR)/usr/local/bin/node-universal $(PKGDIR)/usr/local/bin/node
-	rm -rf $(PKGDIR)/32
-	$(packagemaker) \
-		--id "org.nodejs.NodeJS-$(VERSION)" \
-		--doc tools/osx-pkg.pmdoc \
-		--out $(PKG)
-
-$(TARBALL): node doc
+release-only:
 	@if [ "$(shell git status --porcelain | egrep -v '^\?\? ')" = "" ]; then \
 		exit 0 ; \
 	else \
@@ -233,15 +228,40 @@ $(TARBALL): node doc
 		echo "" >&2 ; \
 		exit 1 ; \
 	fi
-	@if [ $(shell ./node --version) = "$(VERSION)" ]; then \
+	@if [ "$(RELEASE)" = "1" ]; then \
 		exit 0; \
 	else \
 	  echo "" >&2 ; \
-		echo "$(shell ./node --version) doesn't match $(VERSION)." >&2 ; \
+		echo "#NODE_VERSION_IS_RELEASE is set to $(RELEASE)." >&2 ; \
 	  echo "Did you remember to update src/node_version.cc?" >&2 ; \
 	  echo "" >&2 ; \
 		exit 1 ; \
 	fi
+
+pkg: $(PKG)
+
+$(PKG): release-only
+	rm -rf $(PKGDIR)
+	rm -rf out/deps out/Release
+	./configure --prefix=$(PKGDIR)/32/usr/local --without-snapshot --dest-cpu=ia32
+	$(MAKE) install V=$(V)
+	rm -rf out/deps out/Release
+	./configure --prefix=$(PKGDIR)/usr/local --without-snapshot --dest-cpu=x64
+	$(MAKE) install V=$(V)
+	SIGN="$(SIGN)" PKGDIR="$(PKGDIR)" bash tools/osx-codesign.sh
+	lipo $(PKGDIR)/32/usr/local/bin/node \
+		$(PKGDIR)/usr/local/bin/node \
+		-output $(PKGDIR)/usr/local/bin/node-universal \
+		-create
+	mv $(PKGDIR)/usr/local/bin/node-universal $(PKGDIR)/usr/local/bin/node
+	rm -rf $(PKGDIR)/32
+	$(packagemaker) \
+		--id "org.nodejs.Node" \
+		--doc tools/osx-pkg.pmdoc \
+		--out $(PKG)
+	SIGN="$(SIGN)" PKG="$(PKG)" bash tools/osx-productsign.sh
+
+$(TARBALL): release-only node doc
 	git archive --format=tar --prefix=$(TARNAME)/ HEAD | tar xf -
 	mkdir -p $(TARNAME)/doc/api
 	cp doc/node.1 $(TARNAME)/doc/node.1
@@ -252,6 +272,22 @@ $(TARBALL): node doc
 	tar -cf $(TARNAME).tar $(TARNAME)
 	rm -rf $(TARNAME)
 	gzip -f -9 $(TARNAME).tar
+
+tar: $(TARBALL)
+
+$(BINARYTAR): release-only
+	rm -rf $(BINARYNAME)
+	rm -rf out/deps out/Release
+	./configure --prefix=/ --without-snapshot --dest-cpu=$(DESTCPU)
+	$(MAKE) install DESTDIR=$(BINARYNAME) V=$(V) PORTABLE=1
+	cp README.md $(BINARYNAME)
+	cp LICENSE $(BINARYNAME)
+	cp ChangeLog $(BINARYNAME)
+	tar -cf $(BINARYNAME).tar $(BINARYNAME)
+	rm -rf $(BINARYNAME)
+	gzip -f -9 $(BINARYNAME).tar
+
+binary: $(BINARYTAR)
 
 dist-upload: $(TARBALL) $(PKG)
 	ssh node@nodejs.org mkdir -p web/nodejs.org/dist/$(VERSION)
@@ -277,4 +313,4 @@ cpplint:
 
 lint: jslint cpplint
 
-.PHONY: lint cpplint jslint bench clean docopen docclean doc dist distclean check uninstall install install-includes install-bin all staticlib dynamiclib test test-all website-upload pkg blog blogclean
+.PHONY: lint cpplint jslint bench clean docopen docclean doc dist distclean check uninstall install install-includes install-bin all staticlib dynamiclib test test-all website-upload pkg blog blogclean tar binary release-only
